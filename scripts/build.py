@@ -1,0 +1,1881 @@
+#!/usr/bin/env python3
+"""Build NEETTube's 72-chapter NCERT NEET UG YouTube index (data/videos.json).
+
+Pure Python 3 standard library. Run from anywhere:
+
+    python3 scripts/build.py --self-test
+    python3 scripts/build.py
+    python3 scripts/build.py --fresh
+
+Queries YouTube's public web search endpoint across all 72 canonical NCERT NEET UG
+chapters across 4 separate subjects (Botany: 17, Zoology: 15, Physics: 20, Chemistry: 20)
+using clean, focused YouTube queries across both YouTube's native Playlist filter
+(sp=EgIQAw==) and Long-Form Lecture filter (sp=EgIYAg==), plus educator-specific sweeps.
+Enforces a strict Verified NEET UG Educator/Institute Channel allowlist, chapter-matching,
+cross-subject guards, JEE-Advanced/Class-9-10/regional/clickbait rejection, and 100% pure
+YouTube trend ranking (ZERO artificial institute priority).
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import os
+import re
+import ssl
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+CACHE_DIR = ROOT / "data" / "cache"
+OUT_PATH = ROOT / "data" / "videos.json"
+
+INNERTUBE_SEARCH = "https://www.youtube.com/youtubei/v1/search"
+SP_PLAYLIST_ONLY = "EgIQAw=="  # YouTube native Type: Playlist protobuf filter
+SP_LONG_VIDEOS = "EgIYAg=="    # YouTube native Duration: >20 minutes protobuf filter
+
+UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+
+
+def _ssl_context() -> ssl.SSLContext:
+    for cafile in ("/etc/ssl/cert.pem", "/etc/ssl/certs/ca-certificates.crt"):
+        if os.path.exists(cafile):
+            return ssl.create_default_context(cafile=cafile)
+    return ssl.create_default_context()
+
+
+SSL_CTX = _ssl_context()
+_lock = threading.Lock()
+STATS = {"requests": 0, "cached": 0}
+
+# ---------------------------------------------------------------------------
+# Complete 72-Chapter Canonical NCERT NEET UG Syllabus Taxonomy
+# Subjects: Botany (17), Zoology (15), Physics (20), Chemistry (20)
+# Tuple:
+#   (ch_no, subject, unit, class_level, weightage, syllabus_scope, chapter_name,
+#    match_regex, core_search_phrase, alt_search_phrase)
+# ---------------------------------------------------------------------------
+SYLLABUS: list[tuple[int, str, str, str, str, str, str, str, str, str]] = [
+    # ========================== BOTANY (17 Chapters) ==========================
+    (
+        1, "Botany", "Diversity in Living World", "Class 11", "Medium", "NCERT Core",
+        "Living World",
+        r"\b(living world|taxonom(?:y|ic)|binomial nomenclature|systematics)\b",
+        "The Living World Class 11 Biology",
+        "Living World Botany",
+    ),
+    (
+        2, "Botany", "Diversity in Living World", "Class 11", "High", "NCERT Core",
+        "Biological Classification",
+        r"\b(biological classification|five kingdom|monera|protista|fungi\b|viruses|viroids|lichens)\b",
+        "Biological Classification Class 11",
+        "Biological Classification Botany",
+    ),
+    (
+        3, "Botany", "Diversity in Living World", "Class 11", "High", "NCERT Core",
+        "Plant Kingdom",
+        r"\b(plant kingdom|algae\b|bryophytes?|pteridophytes?|gymnosperms?|angiosperms?)\b",
+        "Plant Kingdom Class 11 Biology",
+        "Plant Kingdom Botany",
+    ),
+    (
+        4, "Botany", "Structural Organisation in Plants", "Class 11", "High", "NCERT Core",
+        "Morphology of Flowering Plants",
+        r"\b(morphology of flowering|plant morphology|morphology\s+class\s*11|inflorescence|placentation|plant families)\b",
+        "Morphology of Flowering Plants",
+        "Morphology of Flowering Plants Botany",
+    ),
+    (
+        5, "Botany", "Structural Organisation in Plants", "Class 11", "High", "NCERT Core",
+        "Anatomy of Flowering Plants",
+        r"\b(anatomy of flowering|plant anatomy|meristem\w*|plant tissues|vascular bundles|secondary growth|dicot|monocot)\b",
+        "Anatomy of Flowering Plants",
+        "Anatomy of Flowering Plants Botany",
+    ),
+    (
+        6, "Botany", "Cell Structure & Function", "Class 11", "Very High", "NCERT Core",
+        "Cell: The Unit of Life",
+        r"\b(unit of life|cell\s*:\s*the unit|cell biology|cell structure|prokaryotic|eukaryotic|endomembrane|organelles)\b",
+        "Cell The Unit of Life Class 11",
+        "Cell The Unit of Life Botany",
+    ),
+    (
+        7, "Botany", "Cell Structure & Function", "Class 11", "Very High", "NCERT Core",
+        "Cell Cycle & Cell Division",
+        r"\b(cell cycle|cell division|mitosis|meiosis)\b",
+        "Cell Cycle and Cell Division",
+        "Cell Cycle Cell Division Mitosis Meiosis",
+    ),
+    (
+        8, "Botany", "Plant Physiology", "Class 11", "High", "NCERT Core",
+        "Photosynthesis in Higher Plants",
+        r"\b(photosynthesis|light reaction|calvin cycle|c3\s*(?:and|&)?\s*c4|photorespiration|hatch\s*(?:and|&)?\s*slack)\b",
+        "Photosynthesis in Higher Plants",
+        "Photosynthesis Class 11 Biology",
+    ),
+    (
+        9, "Botany", "Plant Physiology", "Class 11", "High", "NCERT Core",
+        "Respiration in Plants",
+        r"\b(respiration in plants|plant respiration|glycolysis|krebs\s*cycle|tca\s*cycle|electron transport.*plant|oxidative phosphorylation)\b",
+        "Respiration in Plants Class 11",
+        "Respiration in Plants Botany",
+    ),
+    (
+        10, "Botany", "Plant Physiology", "Class 11", "Medium", "NCERT Core",
+        "Plant Growth & Development",
+        r"\b(plant growth|plant hormones|phytohormones|auxins?|gibberellins?|cytokinins?|photoperiodism|vernalisation)\b",
+        "Plant Growth and Development",
+        "Plant Growth and Development Botany",
+    ),
+    (
+        11, "Botany", "Plant Reproduction", "Class 12", "Very High", "NCERT Core",
+        "Sexual Reproduction in Flowering Plants",
+        r"\b(sexual reproduction in flowering|reproduction in flowering|pollination|double fertilization|microsporogenesis|megasporogenesis|endosperm|apomixis)\b",
+        "Sexual Reproduction in Flowering Plants",
+        "Sexual Reproduction in Flowering Plants Class 12",
+    ),
+    (
+        12, "Botany", "Genetics", "Class 12", "Very High", "High-Yield NCERT",
+        "Principles of Inheritance & Variation",
+        r"\b(principles? of inheritance|inheritance\s*(?:and|&)\s*variation|mendel\w*|linkage|recombination|pedigree|chromosomal disorders)\b",
+        "Principles of Inheritance and Variation",
+        "Genetics Principles of Inheritance Class 12",
+    ),
+    (
+        13, "Botany", "Genetics", "Class 12", "Very High", "High-Yield NCERT",
+        "Molecular Basis of Inheritance",
+        r"\b(molecular basis of inheritance|molecular basis|dna replication|transcription|translation|genetic code|lac operon|human genome)\b",
+        "Molecular Basis of Inheritance",
+        "Molecular Basis of Inheritance Class 12",
+    ),
+    (
+        14, "Botany", "Biology in Human Welfare", "Class 12", "Medium", "NCERT Core",
+        "Microbes in Human Welfare",
+        r"\b(microbes in human welfare|sewage treatment|biogas|biofertilizers?|biocontrol agents)\b",
+        "Microbes in Human Welfare",
+        "Microbes in Human Welfare Class 12",
+    ),
+    (
+        15, "Botany", "Ecology & Environment", "Class 12", "High", "NCERT Core",
+        "Organisms & Populations",
+        r"\b(organisms?\s*(?:and|&)\s*populations?|population interactions?|population attributes|mutualism|commensalism|predation)\b",
+        "Organisms and Populations Class 12",
+        "Organisms and Populations Ecology",
+    ),
+    (
+        16, "Botany", "Ecology & Environment", "Class 12", "High", "NCERT Core",
+        "Ecosystem",
+        r"\b(ecosystems?\b|ecological pyramids?|energy flow|decomposition|productivity.*ecology|nutrient cycling)\b",
+        "Ecosystem Class 12 Biology",
+        "Ecosystem Botany Ecology",
+    ),
+    (
+        17, "Botany", "Ecology & Environment", "Class 12", "High", "NCERT Core",
+        "Biodiversity & Conservation",
+        r"\b(biodiversity|conservation|species area|sacred groves|in[- ]situ|ex[- ]situ|red data)\b",
+        "Biodiversity and Conservation Class 12",
+        "Biodiversity and Conservation Ecology",
+    ),
+
+    # ========================= ZOOLOGY (15 Chapters) =========================
+    (
+        18, "Zoology", "Animal Diversity & Organisation", "Class 11", "Very High", "High-Yield NCERT",
+        "Animal Kingdom",
+        r"\b(animal kingdom|non[- ]?chordates?|chordates?|porifera|cnidaria|arthropoda|mollusca|vertebrata)\b",
+        "Animal Kingdom Class 11 Biology",
+        "Animal Kingdom Zoology",
+    ),
+    (
+        19, "Zoology", "Animal Diversity & Organisation", "Class 11", "High", "NCERT Core",
+        "Structural Organisation in Animals",
+        r"\b(structural organi[sz]ation in animals|animal tissues?|cockroach|frog\b|epithelial tissue|connective tissue)\b",
+        "Structural Organisation in Animals",
+        "Animal Tissues Frog Cockroach Zoology",
+    ),
+    (
+        20, "Zoology", "Cell & Biomolecules", "Class 11", "Very High", "High-Yield NCERT",
+        "Biomolecules",
+        r"\b(biomolecules?|enzymes?\b|metabolites?|polysaccharides?|nucleic acids?)\b",
+        "Biomolecules Class 11 Biology",
+        "Biomolecules Zoology Enzymes",
+    ),
+    (
+        21, "Zoology", "Human Physiology", "Class 11", "High", "NCERT Core",
+        "Breathing & Exchange of Gases",
+        r"\b(breathing\s*(?:and|&)\s*exchange|exchange of gases|human respiratory|respiratory volumes|oxygen dissociation)\b",
+        "Breathing and Exchange of Gases",
+        "Breathing and Exchange of Gases Zoology",
+    ),
+    (
+        22, "Zoology", "Human Physiology", "Class 11", "High", "NCERT Core",
+        "Body Fluids & Circulation",
+        r"\b(body fluids?\s*(?:and|&)?\s*circulation|cardiac cycle|\becg\b|human heart|blood groups?|double circulation)\b",
+        "Body Fluids and Circulation",
+        "Body Fluids and Circulation Zoology",
+    ),
+    (
+        23, "Zoology", "Human Physiology", "Class 11", "High", "NCERT Core",
+        "Excretory Products & Elimination",
+        r"\b(excretory products?|elimination|human excretory|nephron|urine formation|counter current|osmoregulation)\b",
+        "Excretory Products and their Elimination",
+        "Excretory Products Elimination Zoology",
+    ),
+    (
+        24, "Zoology", "Human Physiology", "Class 11", "High", "NCERT Core",
+        "Locomotion & Movement",
+        r"\b(locomotion\s*(?:and|&)?\s*movement|muscle contraction|sliding filament|skeletal system|joints\b|sarcomere)\b",
+        "Locomotion and Movement Class 11",
+        "Locomotion and Movement Zoology",
+    ),
+    (
+        25, "Zoology", "Human Physiology", "Class 11", "High", "NCERT Core",
+        "Neural Control & Coordination",
+        r"\b(neural control|nervous system|nerve impulse|synapse|human brain|action potential)\b",
+        "Neural Control and Coordination",
+        "Neural Control and Coordination Zoology",
+    ),
+    (
+        26, "Zoology", "Human Physiology", "Class 11", "High", "NCERT Core",
+        "Chemical Coordination & Integration",
+        r"\b(chemical coordination|endocrine|pituitary|thyroid|adrenal|hormone action)\b",
+        "Chemical Coordination and Integration",
+        "Endocrine System Chemical Coordination",
+    ),
+    (
+        27, "Zoology", "Human Reproduction", "Class 12", "Very High", "High-Yield NCERT",
+        "Human Reproduction",
+        r"\b(human reproduction|gametogenesis|spermatogenesis|oogenesis|menstrual cycle|fertilization and implantation|parturition)\b",
+        "Human Reproduction Class 12",
+        "Human Reproduction Zoology",
+    ),
+    (
+        28, "Zoology", "Human Reproduction", "Class 12", "Medium", "NCERT Core",
+        "Reproductive Health",
+        r"\b(reproductive health|contracepti\w*|amniocentesis|infertility|medical termination|\bmtp\b|assisted reproductive)\b",
+        "Reproductive Health Class 12",
+        "Reproductive Health Zoology",
+    ),
+    (
+        29, "Zoology", "Evolution & Human Health", "Class 12", "High", "NCERT Core",
+        "Evolution",
+        r"\b(evolution\b|hardy[- ]weinberg|natural selection|darwin\w*|adaptive radiation|human evolution|origin of life)\b",
+        "Evolution Class 12 Biology",
+        "Evolution Zoology Class 12",
+    ),
+    (
+        30, "Zoology", "Evolution & Human Health", "Class 12", "Very High", "High-Yield NCERT",
+        "Human Health & Disease",
+        r"\b(human health\s*(?:and|&)?\s*diseases?|immunity|aids\b|cancer\b|malaria|drug\s*(?:and|&)\s*alcohol|antibodies)\b",
+        "Human Health and Disease Class 12",
+        "Human Health and Disease Zoology",
+    ),
+    (
+        31, "Zoology", "Biotechnology", "Class 12", "Very High", "High-Yield NCERT",
+        "Biotechnology: Principles & Processes",
+        r"\b(biotechnology\s*[:|-]?\s*principles?|principles?\s*(?:and|&)\s*process(?:es)?|recombinant dna|\bpcr\b|gel electrophoresis|cloning vectors?|restriction enzymes?|bioreactors?)\b",
+        "Biotechnology Principles and Processes",
+        "Biotechnology Principles Processes Class 12",
+    ),
+    (
+        32, "Zoology", "Biotechnology", "Class 12", "Very High", "High-Yield NCERT",
+        "Biotechnology & Its Applications",
+        r"\b(biotechnology\s*(?:and|&|:|-)?\s*its\s*applications?|applications? of biotechnology|bt\s*cotton|gene therapy|rna interference|genetically engineered insulin|transgenic animals|biopiracy)\b",
+        "Biotechnology and its Applications",
+        "Biotechnology Applications Class 12",
+    ),
+
+    # ========================= PHYSICS (20 Chapters) =========================
+    (
+        33, "Physics", "Mechanics", "Class 11", "High", "NEET UG Core",
+        "Units & Measurements",
+        r"\b(units?\s*(?:and|&)\s*measurements?|units?\s*(?:and|&)\s*dimensions?|dimensional|error analysis|significant figures|vernier|screw gauge|basic maths?\s*(?:for|in)?\s*physics)\b",
+        "Units and Measurements Physics",
+        "Units Dimensions Error Analysis Vernier",
+    ),
+    (
+        34, "Physics", "Mechanics", "Class 11", "High", "NEET UG Core",
+        "Motion in a Straight Line",
+        r"\b(motion in a straight line|motion in 1\s*-?\s*d|motion in one dimension|rectilinear motion|1d\s+kinematics|kinematics\s+1d)\b",
+        "Motion in a Straight Line Class 11",
+        "Kinematics 1D Motion in Straight Line",
+    ),
+    (
+        35, "Physics", "Mechanics", "Class 11", "High", "NEET UG Core",
+        "Motion in a Plane & Projectile",
+        r"\b(motion in a plane|motion in 2\s*-?\s*d|motion in two dimensions|projectile|2d\s+kinematics|kinematics\s+2d|rain\s*man|river\s*boat)\b",
+        "Motion in a Plane Class 11 Physics",
+        "Projectile Motion Kinematics 2D",
+    ),
+    (
+        36, "Physics", "Mechanics", "Class 11", "High", "NEET UG Core",
+        "Laws of Motion & Friction",
+        r"\b(laws? of motion|newton'?s laws?|\bnlm\b|friction|pseudo force|pulley|circular banking)\b",
+        "Laws of Motion Class 11 Physics",
+        "Newton Laws of Motion Friction NLM",
+    ),
+    (
+        37, "Physics", "Mechanics", "Class 11", "High", "NEET UG Core",
+        "Work, Energy & Power",
+        r"\b(work[, ]*(?:energy|power)|work\s*(?:and|&)\s*energy|\bwep\b|\bwpe\b|vertical circular motion)\b",
+        "Work Energy and Power Physics",
+        "Work Power Energy Class 11",
+    ),
+    (
+        38, "Physics", "Mechanics", "Class 11", "Very High", "NEET UG Core",
+        "System of Particles & Rotational Motion",
+        r"\b(system of particles|rotational motion|rotational\b|cent(?:re|er) of mass|\bcom\b|moment of inertia|rigid body|torque|rolling motion|collisions?)\b",
+        "System of Particles and Rotational Motion",
+        "Rotational Motion Centre of Mass Physics",
+    ),
+    (
+        39, "Physics", "Mechanics", "Class 11", "High", "NEET UG Core",
+        "Gravitation",
+        r"\b(gravitation\w*|kepler|escape velocity|orbital velocity|satellites?)\b",
+        "Gravitation Class 11 Physics",
+        "Gravitation Physics",
+    ),
+    (
+        40, "Physics", "Properties of Matter & Thermodynamics", "Class 11", "High", "NEET UG Core",
+        "Mechanical Properties of Solids & Fluids",
+        r"\b(mechanical properties of (?:solids|fluids)|elasticity|fluid mechanics|fluids?\b|surface tension|viscosity|bernoulli|young'?s modulus)\b",
+        "Mechanical Properties of Solids and Fluids",
+        "Fluid Mechanics Elasticity Surface Tension",
+    ),
+    (
+        41, "Physics", "Properties of Matter & Thermodynamics", "Class 11", "High", "NEET UG Core",
+        "Thermal Properties & Heat Transfer",
+        r"\b(thermal properties|thermal physics|heat transfer|calorimetry|thermal expansion|conduction|radiation|newton'?s law of cooling|wein)\b",
+        "Thermal Properties of Matter Physics",
+        "Heat Transfer Calorimetry Thermal Expansion",
+    ),
+    (
+        42, "Physics", "Properties of Matter & Thermodynamics", "Class 11", "Very High", "NEET UG Core",
+        "Thermodynamics & KTG",
+        r"\b(kinetic theory|\bktg\b|thermodynamics|carnot|heat engine|isothermal|adiabatic)\b",
+        "Thermodynamics and KTG Physics",
+        "Kinetic Theory of Gases Thermodynamics Physics",
+    ),
+    (
+        43, "Physics", "Oscillations & Waves", "Class 11", "High", "NEET UG Core",
+        "Oscillations (SHM)",
+        r"\b(oscillations?|simple harmonic|\bshm\b|simple pendulum|spring block)\b",
+        "Oscillations Class 11 Physics",
+        "Simple Harmonic Motion SHM Physics",
+    ),
+    (
+        44, "Physics", "Oscillations & Waves", "Class 11", "High", "NEET UG Core",
+        "Waves & Sound",
+        r"\b(waves?\s*(?:and|&)\s*sound|sound waves?|string waves?|standing waves?|stationary waves?|wave motion|organ pipe|beats\b|doppler|\bwaves\b)\b",
+        "Waves Class 11 Physics",
+        "Sound Waves Organ Pipe Beats Doppler",
+    ),
+    (
+        45, "Physics", "Electrodynamics", "Class 12", "Very High", "NEET UG Core",
+        "Electric Charges, Fields & Potential",
+        r"\b(electric charges|electric fields?|electrostatics?|electrostatic potential|electric potential|gauss'?s?\s*law|electric dipole|coulomb)\b",
+        "Electric Charges and Fields Class 12",
+        "Electrostatic Potential Electrostatics Physics",
+    ),
+    (
+        46, "Physics", "Electrodynamics", "Class 12", "Very High", "NEET UG Core",
+        "Capacitors & Current Electricity",
+        r"\b(capacitors?|capacitance|current electricity|kirchhoff|wheatstone|meter bridge|potentiometer|ohm'?s law)\b",
+        "Current Electricity Class 12 Physics",
+        "Capacitors and Capacitance Current Electricity",
+    ),
+    (
+        47, "Physics", "Electrodynamics", "Class 12", "Very High", "NEET UG Core",
+        "Moving Charges & Magnetism",
+        r"\b(moving charges|magnetic effects? of current|biot[- ]savart|ampere|lorentz|galvanometer|solenoid)\b",
+        "Moving Charges and Magnetism Class 12",
+        "Magnetic Effects of Current Physics",
+    ),
+    (
+        48, "Physics", "Electrodynamics", "Class 12", "High", "NEET UG Core",
+        "Magnetism, Matter & EMI",
+        r"\b(magnetism\s*(?:and|&)\s*matter|electromagnetic induction|\bemi\b|faraday|lenz|inductance|bar magnet|magnetic properties|motional emf)\b",
+        "Electromagnetic Induction Class 12 Physics",
+        "Magnetism and Matter EMI Physics",
+    ),
+    (
+        49, "Physics", "Electrodynamics", "Class 12", "High", "NEET UG Core",
+        "Alternating Current & EM Waves",
+        r"\b(alternating current|\bac\b\s*(?:class\s*12|physics|one\s*shot|in\s+one\s*shot|neet|circuit)|lcr|transformer|electromagnetic waves?|\bem\s+waves?\b)\b",
+        "Alternating Current Class 12 Physics",
+        "Electromagnetic Waves Alternating Current",
+    ),
+    (
+        50, "Physics", "Optics & Modern Physics", "Class 12", "Very High", "NEET UG Core",
+        "Ray Optics & Optical Instruments",
+        r"\b(ray optics|geometrical optics|optical instruments?|refraction|prism|lens|mirror|total internal reflection|microscope|telescope)\b",
+        "Ray Optics and Optical Instruments",
+        "Ray Optics Class 12 Physics",
+    ),
+    (
+        51, "Physics", "Optics & Modern Physics", "Class 12", "High", "NEET UG Core",
+        "Wave Optics",
+        r"\b(wave optics|ydse|young'?s double|interference|diffraction|polarisation|polarization|huygens)\b",
+        "Wave Optics Class 12 Physics",
+        "Wave Optics YDSE Interference",
+    ),
+    (
+        52, "Physics", "Optics & Modern Physics", "Class 12", "Very High", "High-Yield NCERT",
+        "Modern Physics: Atoms, Nuclei & Semiconductors",
+        r"\b(modern physics|dual nature|photoelectric|atoms\b|nuclei\b|nuclear physics|radioactivity|semiconductors?|logic gates?|p[- ]?n junction|diodes?)\b",
+        "Modern Physics Semiconductors Class 12",
+        "Dual Nature Atoms Nuclei Semiconductor",
+    ),
+
+    # ======================== CHEMISTRY (20 Chapters) ========================
+    (
+        53, "Chemistry", "Physical Chemistry", "Class 11", "High", "NEET UG Core",
+        "Some Basic Concepts & Mole Concept",
+        r"\b(some basic concepts|basic concepts of chemistry|mole concept|stoichiometry|limiting reagent|concentration terms|empirical formula)\b",
+        "Mole Concept Some Basic Concepts Chemistry",
+        "Some Basic Concepts of Chemistry Class 11",
+    ),
+    (
+        54, "Chemistry", "Physical Chemistry", "Class 11", "High", "NEET UG Core",
+        "Structure of Atom",
+        r"\b(structure of atom|atomic structure|quantum numbers|bohr'?s?\s*model|electronic configuration|de broglie.*atom|schrodinger)\b",
+        "Structure of Atom Class 11 Chemistry",
+        "Atomic Structure Chemistry",
+    ),
+    (
+        55, "Chemistry", "Inorganic Chemistry", "Class 11", "High", "NCERT Core",
+        "Periodic Classification",
+        r"\b(periodic classification|periodic table|periodicity|classification of elements|periodic properties|ionization enthalpy|electronegativity)\b",
+        "Periodic Table Classification of Elements",
+        "Periodic Classification Class 11 Chemistry",
+    ),
+    (
+        56, "Chemistry", "Inorganic Chemistry", "Class 11", "Very High", "High-Yield NCERT",
+        "Chemical Bonding & Molecular Structure",
+        r"\b(chemical bonding|molecular structure|vsepr|hybridi[sz]ation|molecular orbital|\bmot\b|dipole moment|fajan)\b",
+        "Chemical Bonding and Molecular Structure",
+        "Chemical Bonding Class 11 Chemistry",
+    ),
+    (
+        57, "Chemistry", "Physical Chemistry", "Class 11", "Very High", "NEET UG Core",
+        "Chemical Thermodynamics",
+        r"\b(thermodynamics|thermochemistry|enthalpy|entropy|gibbs|hess'?s?\s*law)\b",
+        "Thermodynamics Class 11 Chemistry",
+        "Chemical Thermodynamics Thermochemistry",
+    ),
+    (
+        58, "Chemistry", "Physical Chemistry", "Class 11", "Very High", "NEET UG Core",
+        "Chemical & Ionic Equilibrium",
+        r"\b(chemical equilibrium|ionic equilibrium|\bequilibrium\b|le chatelier|buffer|solubility product|\bph\b|salt hydrolysis)\b",
+        "Chemical and Ionic Equilibrium Chemistry",
+        "Equilibrium Class 11 Chemistry Ionic",
+    ),
+    (
+        59, "Chemistry", "Physical Chemistry", "Class 12", "Very High", "NEET UG Core",
+        "Redox Reactions & Electrochemistry",
+        r"\b(redox reactions?|redox\b|oxidation number|electrochemistry|nernst|galvanic|electrolytic|kohlrausch|conductance)\b",
+        "Electrochemistry Class 12 Chemistry",
+        "Redox Reactions and Electrochemistry",
+    ),
+    (
+        60, "Chemistry", "Physical Chemistry", "Class 12", "High", "NEET UG Core",
+        "Solutions & Colligative Properties",
+        r"\b(liquid solutions?|solutions?\b|colligative|raoult|van'?t\s*hoff|henry'?s\s*law)\b",
+        "Solutions Class 12 Chemistry",
+        "Liquid Solutions Colligative Properties",
+    ),
+    (
+        61, "Chemistry", "Physical Chemistry", "Class 12", "High", "NEET UG Core",
+        "Chemical Kinetics",
+        r"\b(chemical kinetics|\bkinetics\b|rate law|first order|zero order|arrhenius|order of reaction|half life)\b",
+        "Chemical Kinetics Class 12 Chemistry",
+        "Chemical Kinetics Chemistry",
+    ),
+    (
+        62, "Chemistry", "Inorganic Chemistry", "Class 12", "High", "NCERT Core",
+        "p-Block Elements",
+        r"\b(p[- ]?block|group\s*(?:13|14|15|16|17|18)|boron family|carbon family|nitrogen family|oxygen family|halogens|noble gases)\b",
+        "p Block Elements Chemistry",
+        "p Block Class 11 12 Inorganic",
+    ),
+    (
+        63, "Chemistry", "Inorganic Chemistry", "Class 12", "High", "NCERT Core",
+        "d- & f-Block Elements",
+        r"\b(d\s*(?:and|&)\s*f\s*[- ]?block|d[- ]block|f[- ]block|transition elements|lanthanoids|actinoids|kmno4|k2cr2o7)\b",
+        "d and f Block Elements Class 12",
+        "d and f Block Inorganic Chemistry",
+    ),
+    (
+        64, "Chemistry", "Inorganic Chemistry", "Class 12", "Very High", "High-Yield NCERT",
+        "Coordination Compounds",
+        r"\b(coordination compounds?|coordination chemistry|crystal field|\bcft\b|werner|valence bond.*coordination|ligands?)\b",
+        "Coordination Compounds Class 12",
+        "Coordination Compounds Inorganic Chemistry",
+    ),
+    (
+        65, "Chemistry", "Organic Chemistry", "Class 11", "Very High", "High-Yield NCERT",
+        "Purification & General Organic Chemistry (GOC)",
+        r"\b(general organic chemistry|\bgoc\b|purification.*organic|inductive|resonance|hyperconjugation|mesomeric|aromaticity|carbocation|reaction intermediates)\b",
+        "General Organic Chemistry GOC",
+        "Purification and GOC Organic Chemistry",
+    ),
+    (
+        66, "Chemistry", "Organic Chemistry", "Class 11", "High", "NEET UG Core",
+        "IUPAC & Isomerism",
+        r"\b(iupac|nomenclature|isomerism|stereoisomerism|optical isomerism|geometrical isomerism|conformational|chirality)\b",
+        "IUPAC Nomenclature and Isomerism",
+        "Isomerism Organic Chemistry",
+    ),
+    (
+        67, "Chemistry", "Organic Chemistry", "Class 11", "Very High", "High-Yield NCERT",
+        "Hydrocarbons",
+        r"\b(hydrocarbons?|alkanes?|alkenes?|alkynes?|aromatic hydrocarbons?|benzene|ozonolysis|markovnikov)\b",
+        "Hydrocarbons Class 11 Chemistry",
+        "Hydrocarbons Organic Chemistry",
+    ),
+    (
+        68, "Chemistry", "Organic Chemistry", "Class 12", "High", "NEET UG Core",
+        "Haloalkanes & Haloarenes",
+        r"\b(haloalkanes?|haloarenes?|alkyl halides?|aryl halides?|sn1|sn2|grignard)\b",
+        "Haloalkanes and Haloarenes Class 12",
+        "Haloalkanes Haloarenes Organic Chemistry",
+    ),
+    (
+        69, "Chemistry", "Organic Chemistry", "Class 12", "High", "NEET UG Core",
+        "Alcohols, Phenols & Ethers",
+        r"\b(alcohols?|phenols?|ethers?|reimer[- ]tiemann|kolbe|williamson)\b",
+        "Alcohols Phenols and Ethers Class 12",
+        "Alcohol Phenol Ether Organic Chemistry",
+    ),
+    (
+        70, "Chemistry", "Organic Chemistry", "Class 12", "Very High", "High-Yield NCERT",
+        "Aldehydes, Ketones & Carboxylic Acids",
+        r"\b(aldehydes?|ketones?|carboxylic|carbonyl|aldol|cannizzaro|clemmensen|wolff[- ]kishner)\b",
+        "Aldehydes Ketones and Carboxylic Acids",
+        "Carbonyl Compounds Aldehyde Ketone",
+    ),
+    (
+        71, "Chemistry", "Organic Chemistry", "Class 12", "High", "NEET UG Core",
+        "Amines & Diazonium Salts",
+        r"\b(amines?\b|diazonium|nitrogen containing organic|gabriel phthalimide|hoffmann bromamide|carbylamine)\b",
+        "Amines Class 12 Chemistry",
+        "Amines and Diazonium Salts Organic",
+    ),
+    (
+        72, "Chemistry", "Organic Chemistry", "Class 12", "High", "NCERT Core",
+        "Biomolecules & Practical Chemistry",
+        r"\b(biomolecules?|carbohydrates?|glucose|amino acids|practical organic|\bpoc\b|practical chemistry|salt analysis)\b",
+        "Biomolecules Class 12 Chemistry",
+        "Practical Chemistry Salt Analysis POC",
+    ),
+]
+
+TEACHER_PLAYLIST_SWEEPS: list[tuple[str, str]] = [
+    # Physics Wallah / Competition Wallah / Yakeen / Prachand / Aarambh
+    ("Biology", "Competition Wallah NEET Biology"),
+    ("Botany", "Competition Wallah Botany Tarun Sir Vipin Sir"),
+    ("Zoology", "Competition Wallah Zoology Samapti Mam MD Sir"),
+    ("Physics", "Competition Wallah NEET Physics MR Sir"),
+    ("Chemistry", "Competition Wallah NEET Chemistry Pankaj Sir"),
+    ("Biology", "Prachand NEET Biology"),
+    ("Physics", "Prachand NEET Physics"),
+    ("Chemistry", "Prachand NEET Chemistry"),
+    ("Biology", "Aarambh NEET Biology"),
+    ("Physics", "Aarambh NEET Physics"),
+    ("Chemistry", "Aarambh NEET Chemistry"),
+    ("Biology", "Yakeen NEET Biology"),
+    ("Physics", "Yakeen NEET Physics"),
+    ("Chemistry", "Yakeen NEET Chemistry"),
+    # Top Individual NEET Educators
+    ("Biology", "Seep Pahuja NEET Biology"),
+    ("Biology", "Garima Goel NEET Biology"),
+    ("Biology", "Ritu Rattewal NEET Biology"),
+    ("Botany", "Tarun Sir Botany NEET"),
+    ("Biology", "Vipin Sharma Ozone Classes Biology NEET"),
+    ("Biology", "KV Education NEET Biology"),
+    ("Chemistry", "Nitesh Devnani NEET Chemistry"),
+    ("Chemistry", "VT Sir NEET Chemistry"),
+    ("Chemistry", "Pankaj Sir Chemistry NEET"),
+    ("Physics", "Tamanna Chaudhary NEET Physics"),
+    ("Physics", "MR Sir NEET Physics"),
+    # Unacademy NEET, NEET Alchemy, Toppers
+    ("Biology", "Unacademy NEET Biology"),
+    ("Physics", "Unacademy NEET Physics"),
+    ("Chemistry", "Unacademy NEET Chemistry"),
+    ("Biology", "NEET Alchemy Biology"),
+    ("Chemistry", "NEET Alchemy Chemistry"),
+    ("Physics", "NEET Alchemy Physics"),
+    ("Biology", "Unacademy NEET Toppers Biology"),
+    # ALLEN NEET, Aakash NEET, Vedantu NEET, Adda247, Sankalp, New Light, Biomentors, Motion, eSaral, Sri Chaitanya, Rankplus
+    ("Biology", "ALLEN NEET Biology"),
+    ("Physics", "ALLEN NEET Physics"),
+    ("Chemistry", "ALLEN NEET Chemistry"),
+    ("Biology", "Aakash NEET Biology"),
+    ("Physics", "Aakash NEET Physics"),
+    ("Chemistry", "Aakash NEET Chemistry"),
+    ("Biology", "Vedantu NEET Biology"),
+    ("Physics", "Vedantu NEET Physics"),
+    ("Chemistry", "Vedantu NEET Chemistry"),
+    ("Biology", "NEET Adda247 Biology"),
+    ("Chemistry", "NEET Adda247 Chemistry"),
+    ("Physics", "NEET Adda247 Physics"),
+    ("Biology", "Sankalp NEET Biology"),
+    ("Biology", "Doctor Next NEET"),
+    ("Biology", "New Light Institute NEET Biology"),
+    ("Chemistry", "New Light Institute NEET Chemistry"),
+    ("Biology", "Biomentors NEET Biology"),
+    ("Physics", "Motion NEET Physics"),
+    ("Chemistry", "Motion NEET Chemistry"),
+    ("Physics", "eSaral NEET Physics"),
+    ("Biology", "Sri Chaitanya Academy NEET"),
+    ("Biology", "Infinity Learn NEET"),
+    ("Biology", "Rankplus NEET"),
+]
+
+INSTITUTE_VIDEO_SWEEPS: list[tuple[str, str]] = [
+    ("Botany", "Competition Wallah Botany One Shot NEET"),
+    ("Zoology", "Competition Wallah Zoology One Shot NEET"),
+    ("Physics", "Competition Wallah Physics One Shot MR Sir NEET"),
+    ("Chemistry", "Competition Wallah Chemistry One Shot NEET"),
+    ("Biology", "Umeed NEET Biology One Shot Competition Wallah"),
+    ("Physics", "Umeed NEET Physics One Shot Competition Wallah"),
+    ("Chemistry", "Umeed NEET Chemistry One Shot Competition Wallah"),
+    ("Biology", "Prachand NEET One Shot Biology"),
+    ("Physics", "Prachand NEET One Shot Physics"),
+    ("Chemistry", "Prachand NEET One Shot Chemistry"),
+    ("Biology", "Seep Pahuja One Shot NEET Biology"),
+    ("Biology", "Garima Goel One Shot NCERT NEET"),
+    ("Biology", "Ritu Rattewal One Shot Biology NEET"),
+    ("Biology", "Vipin Sharma NCERT One Shot NEET Biology"),
+    ("Botany", "Tarun Sir One Shot Botany NEET"),
+    ("Biology", "KV Education One Shot NEET Biology"),
+    ("Chemistry", "Nitesh Devnani One Shot NEET Chemistry"),
+    ("Chemistry", "VT Sir One Shot NEET Chemistry"),
+    ("Chemistry", "Pankaj Sir Chemistry NEET One Shot"),
+    ("Physics", "Tamanna Chaudhary One Shot NEET Physics"),
+    ("Biology", "ALLEN NEET One Shot Biology"),
+    ("Physics", "ALLEN NEET One Shot Physics"),
+    ("Chemistry", "ALLEN NEET One Shot Chemistry"),
+    ("Biology", "Aakash NEET One Shot Biology"),
+    ("Physics", "Aakash NEET One Shot Physics"),
+    ("Chemistry", "Aakash NEET One Shot Chemistry"),
+    ("Biology", "Vedantu NEET One Shot Biology"),
+    ("Physics", "Vedantu NEET One Shot Physics"),
+    ("Chemistry", "Vedantu NEET One Shot Chemistry"),
+    ("Biology", "NEET Adda247 One Shot Biology"),
+    ("Chemistry", "NEET Adda247 One Shot Chemistry"),
+    ("Physics", "NEET Adda247 One Shot Physics"),
+    ("Biology", "Unacademy NEET One Shot Biology"),
+    ("Physics", "Unacademy NEET One Shot Physics"),
+    ("Chemistry", "Unacademy NEET One Shot Chemistry"),
+    ("Biology", "New Light Institute NEET One Shot"),
+    ("Biology", "Rankplus NEET One Shot"),
+    ("Biology", "Infinity Learn NEET One Shot"),
+]
+
+# Curated Allowlist of Legitimate NEET UG Educators & Official Institute Channels
+VERIFIED_CHANNEL_SUBSTRINGS = (
+    "competition wallah",
+    "yakeen",
+    "physics wallah",
+    "lakshya neet",
+    "arjuna neet",
+    "pw neet",
+    "neet pw",
+    "pw class 11",
+    "pw english",
+    "pw vidyapeeth",
+    "pw power prep",
+    "pw test series",
+    "neet wallah",
+    "ncert wallah",
+    "prachand",
+    "aarambh",
+    "unacademy neet",
+    "neet alchemy",
+    "neet achievers by unacademy",
+    "unacademy sapiens",
+    "akansha karnwal unacademy",
+    "unacademy neet toppers",
+    "let's crack neet",
+    "allen neet",
+    "allen career institute",
+    "allen digital",
+    "allen online",
+    "aakash neet",
+    "aakash institute",
+    "neet@aakash",
+    "aakash byju",
+    "byju's neet",
+    "byjus neet",
+    "vedantu neet",
+    "vedantu biotonic",
+    "neet adda247",
+    "adda247 neet",
+    "doctors adda",
+    "garima goel",
+    "seep pahuja",
+    "tarun sir",
+    "ritu rattewal",
+    "vipin sharma",
+    "ozone classes",
+    "kv education",
+    "nitesh devnani",
+    "tamanna chaudhary",
+    "sankalp",
+    "doctor next",
+    "new light institute",
+    "new light neet",
+    "new light prayaas",
+    "biomentors",
+    "esaral",
+    "motion neet",
+    "motion education",
+    "sri chaitanya academy neet",
+    "infinity learn neet",
+    "neet infinity learn",
+    "infinity learn",
+    "rankplus",
+    "pankaj sir chemistry",
+    "vt sir",
+    "vishal tiwari",
+    "mr sir",
+)
+
+# Reject regional language channels & titles (Tamil/Telugu/Malayalam/Kannada/etc.)
+REGIONAL_REJECT_RE = re.compile(
+    r"\b(tamil|telugu|malayalam|kannada|bangla|bengali|marathi|gujarati|odia|assamese|"
+    r"vaathi|xylem|pasanga|telugu\s*neet|tamil\s*neet|kannada\s*neet|malayalam\s*neet)\b",
+    re.I,
+)
+
+# Reject fan-clip channels, shorts aggregators, MBBS/PG channels, and non-NEET exam channels
+CHANNEL_DISQUALIFY_RE = re.compile(
+    r"\b(fan\s*page|fan\s*club|fans\b|pupils|disciples|emotion|moments|clips|shorts|"
+    r"goats\s+of|shayari|comedy|parody|roast|yakeenian\w*|pwian\w*|unofficial|tribute|status|edits|"
+    r"vibes|army|lovers|meded|neet\s*pg|fmge|ini\s*cet|usmle|"
+    r"jee\s*wallah|lakshya\s*jee|arjuna\s*jee|pw\s*jee|jee\s*challengers|"
+    r"allen\s*jee|unacademy\s*jee|unacademy\s*atoms|jee\s*nexus|jeefinity|jee\s*legends|jee\s*alchemy|"
+    r"aakash\s*jee|jee@aakash|byju'?s\s*jee|vedantu\s*jee|motion\s*jee|vmc\s*jee|"
+    r"sri\s*chaitanya\s*academy\s*jee|infinity\s*learn\s*jee|rankers\s*jee|"
+    r"mathongo|jeeongo|eduniti|mohit\s*tyagi|competishun|mathsmerizing|"
+    r"pw\s*foundation|udaan|neev|commerce\s*wallah|arts\s*wallah|gate\s*wallah|"
+    r"ssc\s*wallah|upsc\s*wallah|banking\s*wallah|defence\s*wallah|cuet\s*wallah|"
+    r"law\s*wallah|ca\s*wallah|teaching\s*wallah|sankalp\s*ssc|sankalp\s*civil)\b",
+    re.I,
+)
+
+# Strict Title Rejections: JEE-Advanced-only, Class 9/10, Regional, and Non-lecture noise
+HARD_REJECT_RE = re.compile(
+    r"\b(jee\s*adv\w*|irodov|pathfinder|mathongo|jeeongo|black\s*book|cengage\s*jee|josaa|"
+    r"bitsat|wbjee|mht\s*cet|kcet|comedk|viteee|neet\s*pg|fmge|ini\s*cet|mbbs\s*1st\s*year|"
+    r"class\s*(?:6|7|8|9|10|ix|x)\b|icse|ssc\s+cgl|upsc|tgt|pgt|dsssb|kvs|cuet\s+only|"
+    r"vlog\w*|prank|controversy|exposed|roast|reaction\s+video|"
+    r"cutoff|cut[\s-]*off|marks\s+vs\s+rank|rank\s+vs\s+college|safe\s+score|"
+    r"college\s+review|campus\s+tour|hostel\s+tour|medical\s+college\s+life|"
+    r"counselling|mcc\s+counselling|choice\s+filling|seat\s+matrix|"
+    r"dress\s+code|admit\s+card|omr\s+sheet|city\s+intimation|application\s+form|registration\s+process|"
+    r"supreme\s+court|re[\s-]*neet|paper\s+leak|nta\s+latest|nta\s+official\s+update|"
+    r"answer\s+key|paper\s+discussion|paper\s+analysis|paper\s+solutions?|question\s+paper\s+solutions?|"
+    r"video\s+solutions|memory\s+based|"
+    r"toppers?\s+talk|topper'?s?\s+interview|toppers?\s+interview|topper\s+podcast|podcast\s+with|"
+    r"topper'?s?\s+success|success\s+story|success\s+meet|full\s+interview|air\s*1\s+interview|"
+    r"result\s+reaction|result\s+celebration|orientation\s+session|study\s+material\s+review|"
+    r"time\s*table|how\s+to\s+crack|strategy\s+to\s+score|strategy\s+for\s+neet|"
+    r"best\s+books\s+for|motivation|motivational|shorts|#shorts)\b",
+    re.I,
+)
+
+ENGLISH_MEDIUM_CUES = (
+    "unacademy neet english",
+    "vedantu neet english",
+    "pw english",
+    "infinity learn neet",
+)
+
+
+def parse_views(text: str) -> int:
+    if not text:
+        return 0
+    cleaned = text.lower().replace(",", "").strip()
+    m = re.search(r"([\d.]+)\s*([kmb]|lakh|cr)?", cleaned)
+    if not m:
+        return 0
+    val = float(m.group(1))
+    mult = m.group(2) or ""
+    if mult == "k":
+        val *= 1_000
+    elif mult == "m":
+        val *= 1_000_000
+    elif mult == "b":
+        val *= 1_000_000_000
+    elif mult == "lakh":
+        val *= 100_000
+    elif mult == "cr":
+        val *= 10_000_000
+    return int(val)
+
+
+def parse_duration_seconds(text: str) -> int:
+    if not text:
+        return 0
+    parts = [int(p) for p in re.findall(r"\d+", text)]
+    if len(parts) == 3:
+        return parts[0] * 3600 + parts[1] * 60 + parts[2]
+    if len(parts) == 2:
+        return parts[0] * 60 + parts[1]
+    if len(parts) == 1:
+        return parts[0]
+    return 0
+
+
+def parse_lesson_count(text: str) -> int:
+    if not text:
+        return 0
+    m = re.search(r"(\d+)", text.replace(",", ""))
+    return int(m.group(1)) if m else 0
+
+
+def search_youtube(query: str, params: str = "", use_cache: bool = True) -> dict:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache_id = f"{query}::sp={params}" if params else query
+    key = hashlib.sha1(cache_id.encode("utf-8")).hexdigest()
+    cpath = CACHE_DIR / f"{key}.json"
+    if use_cache and cpath.exists():
+        with _lock:
+            STATS["cached"] += 1
+        return json.loads(cpath.read_text(encoding="utf-8"))
+
+    body: dict = {
+        "context": {
+            "client": {
+                "clientName": "WEB",
+                "clientVersion": "2.20250101.00.00",
+                "hl": "en",
+                "gl": "IN",
+            }
+        },
+        "query": query,
+    }
+    if params:
+        body["params"] = params
+    payload = json.dumps(body).encode("utf-8")
+
+    last_err = None
+    for attempt in range(4):
+        try:
+            req = urllib.request.Request(
+                INNERTUBE_SEARCH,
+                data=payload,
+                headers={"User-Agent": UA, "Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=15, context=SSL_CTX) as resp:
+                data = json.load(resp)
+            with _lock:
+                STATS["requests"] += 1
+            cpath.write_text(json.dumps(data), encoding="utf-8")
+            return data
+        except Exception as exc:  # noqa: BLE001
+            last_err = exc
+            time.sleep(0.7 * (attempt + 1))
+    print(f"WARN: search failed for {query!r}: {last_err}", flush=True)
+    return {}
+
+
+def extract_candidates(payload: dict) -> list[dict]:
+    items = []
+    try:
+        sections = (
+            payload["contents"]["twoColumnSearchResultsRenderer"]["primaryContents"]
+            ["sectionListRenderer"]["contents"]
+        )
+    except (KeyError, TypeError):
+        return items
+
+    for sec in sections:
+        contents = sec.get("itemSectionRenderer", {}).get("contents", [])
+        for entry in contents:
+            if "lockupViewModel" in entry:
+                parsed = _parse_lockup(entry["lockupViewModel"])
+                if parsed:
+                    items.append(parsed)
+            elif "playlistRenderer" in entry:
+                parsed = _parse_legacy_playlist(entry["playlistRenderer"])
+                if parsed:
+                    items.append(parsed)
+            elif "videoRenderer" in entry:
+                parsed = _parse_video(entry["videoRenderer"])
+                if parsed:
+                    items.append(parsed)
+    return items
+
+
+def _parse_lockup(lv: dict) -> dict | None:
+    cid = (lv.get("contentId") or "").strip()
+    ctype = lv.get("contentType") or ""
+    if not cid or ("PLAYLIST" not in ctype and "COURSE" not in ctype and not cid.startswith("PL")):
+        return None
+    if cid.startswith("RD"):
+        return None
+
+    meta_vm = lv.get("metadata", {}).get("lockupMetadataViewModel", {})
+    title = (meta_vm.get("title", {}).get("content") or "").strip()
+    if not title:
+        return None
+
+    rows = (
+        meta_vm.get("metadata", {})
+        .get("contentMetadataViewModel", {})
+        .get("metadataRows", [])
+    )
+    channel = ""
+    channel_url = ""
+    sample_lectures: list[dict] = []
+
+    for row in rows:
+        parts = row.get("metadataParts") or []
+        for part in parts:
+            txt_obj = part.get("text") or {}
+            content = (txt_obj.get("content") or "").strip()
+            if not content or content.lower() in {"playlist", "course", "view full playlist", "view full course", "podcast"}:
+                continue
+            cmd_runs = txt_obj.get("commandRuns") or []
+            web_url = ""
+            watch_vid = ""
+            if cmd_runs:
+                icmd = cmd_runs[0].get("onTap", {}).get("innertubeCommand", {})
+                web_url = icmd.get("commandMetadata", {}).get("webCommandMetadata", {}).get("url") or ""
+                watch_vid = icmd.get("watchEndpoint", {}).get("videoId") or ""
+
+            if not channel and (web_url.startswith("/@") or web_url.startswith("/channel/") or web_url.startswith("/c/")):
+                channel = content
+                channel_url = f"https://www.youtube.com{web_url}"
+            elif watch_vid and len(sample_lectures) < 4:
+                sample_lectures.append(
+                    {
+                        "video_id": watch_vid,
+                        "title": content,
+                        "url": f"https://www.youtube.com/watch?v={watch_vid}&list={cid}",
+                    }
+                )
+
+    if not channel and rows:
+        first_parts = rows[0].get("metadataParts") or []
+        if first_parts:
+            channel = (first_parts[0].get("text", {}).get("content") or "").strip()
+
+    thumb_vm = (
+        lv.get("contentImage", {})
+        .get("collectionThumbnailViewModel", {})
+        .get("primaryThumbnail", {})
+        .get("thumbnailViewModel", {})
+    )
+    sources = thumb_vm.get("image", {}).get("sources") or []
+    thumbnail = sources[-1]["url"] if sources else ""
+
+    lesson_count = 0
+    for ov in thumb_vm.get("overlays") or []:
+        badges = ov.get("thumbnailOverlayBadgeViewModel", {}).get("thumbnailBadges") or []
+        for b in badges:
+            btxt = b.get("thumbnailBadgeViewModel", {}).get("text") or ""
+            cnt = parse_lesson_count(btxt)
+            if cnt:
+                lesson_count = cnt
+                break
+
+    embed_vid = sample_lectures[0]["video_id"] if sample_lectures else ""
+    if not embed_vid and thumbnail:
+        m = re.search(r"/vi/([A-Za-z0-9_-]{11})/", thumbnail)
+        if m:
+            embed_vid = m.group(1)
+
+    return {
+        "provider": "playlist",
+        "video_id": cid,
+        "embed_video_id": embed_vid,
+        "url": f"https://www.youtube.com/playlist?list={cid}",
+        "title": title,
+        "channel": channel or "NEET UG Faculty",
+        "channel_url": channel_url,
+        "thumbnail": thumbnail,
+        "lesson_count": lesson_count,
+        "duration": "",
+        "duration_sec": 0,
+        "views_text": "",
+        "view_count": 0,
+        "published": "",
+        "sample_lectures": sample_lectures,
+    }
+
+
+def _parse_legacy_playlist(pr: dict) -> dict | None:
+    cid = (pr.get("playlistId") or "").strip()
+    title = (pr.get("title", {}).get("simpleText") or "").strip()
+    if not cid or not title or cid.startswith("RD"):
+        return None
+    runs = pr.get("shortBylineText", {}).get("runs") or pr.get("longBylineText", {}).get("runs") or []
+    channel = (runs[0].get("text") if runs else "").strip() or "NEET UG Faculty"
+    thumbs = pr.get("thumbnails", [{}])[0].get("thumbnails") or []
+    thumbnail = thumbs[-1].get("url", "") if thumbs else ""
+    embed_vid = ""
+    if thumbnail:
+        m = re.search(r"/vi/([A-Za-z0-9_-]{11})/", thumbnail)
+        if m:
+            embed_vid = m.group(1)
+    lesson_count = parse_lesson_count(pr.get("videoCount") or "")
+    return {
+        "provider": "playlist",
+        "video_id": cid,
+        "embed_video_id": embed_vid,
+        "url": f"https://www.youtube.com/playlist?list={cid}",
+        "title": title,
+        "channel": channel,
+        "channel_url": "",
+        "thumbnail": thumbnail,
+        "lesson_count": lesson_count,
+        "duration": "",
+        "duration_sec": 0,
+        "views_text": "",
+        "view_count": 0,
+        "published": "",
+        "sample_lectures": [],
+    }
+
+
+def _parse_video(vr: dict) -> dict | None:
+    vid = (vr.get("videoId") or "").strip()
+    runs = vr.get("title", {}).get("runs") or []
+    title = "".join(r.get("text", "") for r in runs).strip()
+    if not vid or not title or len(vid) != 11:
+        return None
+
+    owner_runs = vr.get("ownerText", {}).get("runs") or vr.get("longBylineText", {}).get("runs") or []
+    channel = (owner_runs[0].get("text") if owner_runs else "").strip() or "NEET UG Faculty"
+    channel_url = ""
+    if owner_runs:
+        wurl = (
+            owner_runs[0]
+            .get("navigationEndpoint", {})
+            .get("commandMetadata", {})
+            .get("webCommandMetadata", {})
+            .get("url")
+            or ""
+        )
+        if wurl:
+            channel_url = f"https://www.youtube.com{wurl}"
+
+    length_text = (vr.get("lengthText", {}).get("simpleText") or "").strip()
+    dur_sec = parse_duration_seconds(length_text)
+
+    views_text = (vr.get("viewCountText", {}).get("simpleText") or "").strip()
+    view_count = parse_views(views_text)
+    published = (vr.get("publishedTimeText", {}).get("simpleText") or "").strip()
+
+    thumbs = vr.get("thumbnail", {}).get("thumbnails") or []
+    thumbnail = thumbs[-1].get("url", "") if thumbs else f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"
+
+    return {
+        "provider": "youtube",
+        "video_id": vid,
+        "embed_video_id": vid,
+        "url": f"https://www.youtube.com/watch?v={vid}",
+        "title": title,
+        "channel": channel,
+        "channel_url": channel_url,
+        "thumbnail": thumbnail,
+        "lesson_count": 0,
+        "duration": length_text,
+        "duration_sec": dur_sec,
+        "views_text": views_text,
+        "view_count": view_count,
+        "published": published,
+        "sample_lectures": [],
+    }
+
+
+def is_verified_neet_channel(channel: str) -> bool:
+    if not channel:
+        return False
+    low = channel.casefold().strip()
+    if REGIONAL_REJECT_RE.search(low):
+        return False
+    if CHANNEL_DISQUALIFY_RE.search(low):
+        return False
+    # Reject JEE-only channels while permitting multi-exam channels that explicitly include NEET (e.g. eSaral)
+    if re.search(r"\b(jee|iit)\b", low) and not re.search(r"\bneet\b", low):
+        return False
+    if any(sub in low for sub in VERIFIED_CHANNEL_SUBSTRINGS):
+        return True
+    return False
+
+
+def resolve_institute(cand: dict) -> str:
+    ch_low = cand["channel"].lower()
+    if any(
+        k in ch_low
+        for k in (
+            "competition wallah",
+            "yakeen",
+            "physics wallah",
+            "lakshya neet",
+            "arjuna neet",
+            "pw neet",
+            "neet pw",
+            "pw class 11",
+            "pw english",
+            "pw vidyapeeth",
+            "pw power prep",
+            "pw test series",
+            "neet wallah",
+            "ncert wallah",
+            "prachand",
+            "aarambh",
+        )
+    ):
+        return "Physics Wallah (PW)"
+    if any(k in ch_low for k in ("unacademy", "neet alchemy", "let's crack neet")):
+        return "Unacademy NEET"
+    if "allen" in ch_low:
+        return "ALLEN NEET"
+    if "aakash" in ch_low or "byju" in ch_low:
+        return "Aakash & BYJU'S NEET"
+    if "vedantu" in ch_low:
+        return "Vedantu NEET"
+    if any(k in ch_low for k in ("adda247", "doctors adda", "sankalp", "doctor next")):
+        return "Adda247 & Sankalp NEET"
+    if "new light" in ch_low or "biomentors" in ch_low:
+        return "New Light & Biomentors"
+    if "sri chaitanya" in ch_low or "infinity learn" in ch_low:
+        return "Sri Chaitanya & Infinity Learn"
+    if any(k in ch_low for k in ("motion", "esaral", "rankplus")):
+        return "Motion, eSaral & Rankplus"
+    return "Independent NEET Specialists"
+
+
+def resolve_educator(cand: dict, subject: str, unit: str) -> str:
+    blob = f"{cand['title']} {cand['channel']}".lower()
+
+    teacher_rules = [
+        (r"\bmr\s*sir\b|\bmanish\s*raj\b", "MR Sir (Manish Raj)"),
+        (r"\btarun\s*sir\b|\btarun\s*kumar\b", "Tarun Sir (Botany)"),
+        (r"\bseep\s*pahuja\b", "Seep Pahuja Ma'am"),
+        (r"\bgarima\s*goel\b", "Garima Goel Ma'am"),
+        (r"\britu\s*rattewal\b", "Ritu Rattewal Ma'am"),
+        (r"\bvipin\s*(?:kumar\s*)?sharma\b|ozone\s*classes", "Vipin Sharma (Ozone Classes)"),
+        (r"kv\s*education", "KV Education"),
+        (r"\bnitesh\s*devnani\b", "Nitesh Devnani Sir"),
+        (r"\btamanna\s*chaudhary\b", "Tamanna Chaudhary Ma'am"),
+        (r"\bpankaj\s*sir\b|\bpankaj\s*sijairya\b", "Pankaj Sir Chemistry"),
+        (r"\bvt\s*sir\b|\bvishal\s*tiwari\b", "VT Sir (Vishal Tiwari)"),
+        (r"\bsamapti\s*(?:sinha\s*)?(?:ma'?am|mahapatra)?\b", "Samapti Sinha Ma'am"),
+        (r"\bmanish\s*dubey\b|\bmd\s*sir\b", "MD Sir (Manish Dubey)"),
+        (r"\brupesh\s*chaudhary\b|\brupesh\s*sir\b", "Rupesh Chaudhary Sir"),
+        (r"\bakanksha\s*agarwal\b|\bguru\s*maa\b", "Akanksha Agarwal Ma'am"),
+        (r"\bakansha\s*karnwal\b", "Akansha Karnwal Ma'am"),
+        (r"\bsudhanshu\s*(?:tak\s*)?sir\b|\bsudhanshu\s*tak\b", "Sudhanshu Sir"),
+        (r"\bamit\s*mahajan\b", "Amit Mahajan Sir"),
+        (r"\byogesh\s*jain\b", "Yogesh Jain Sir"),
+        (r"\bmohit\s*dadheech\b", "Mohit Dadheech Sir"),
+        (r"\bhitesh\s*sopra\b", "Hitesh Sopra Sir"),
+        (r"\bayudh\s*(?:yashlaha\s*)?sir\b|\bayudh\s*yashlaha\b", "Ayudh Yashlaha Sir"),
+        (r"\bprateek\s*jain\b", "Prateek Jain Sir"),
+        (r"\bmahendra\s*singh\b", "Mahendra Singh Sir"),
+        (r"\banupam\s*upadhyay\b", "Anupam Upadhyay Sir"),
+        (r"\bwassim\s*bhat\b", "Wassim Bhat Sir"),
+        (r"\bvani\s*sood\b|\bvani\s*ma'?am\b|vedantu\s*biotonic", "Vani Ma'am (Vedantu)"),
+        (r"\bgargi\s*singh\b", "Dr. Gargi Singh"),
+        (r"\bambika\s*(?:sharma|ma'?am)\b", "Ambika Ma'am"),
+        (r"\balakh\s*pandey\b|physics\s*wallah\s*-\s*alakh", "Alakh Pandey Sir"),
+        (r"\bgeetendra\b|biomentors", "Dr. Geetendra (Biomentors)"),
+        (r"new\s*light\s*institute|new\s*light\s*neet|\bs\.?\s*p\.?\s*singh\b", "New Light Institute"),
+        (r"allen\s*neet|allen\s*career|allen\s*digital|allen\s*online", "ALLEN NEET"),
+        (r"aakash.*byju|byju.*neet", "Aakash BYJU'S NEET"),
+        (r"aakash\s*neet|neet@aakash", "Aakash NEET"),
+        (r"sri\s*chaitanya|infinity\s*learn", "Sri Chaitanya / Infinity Learn NEET"),
+        (r"motion\s*neet|motion\s*education", "Motion NEET Kota"),
+        (r"esaral", "eSaral NEET"),
+        (r"neet\s*adda247|adda247\s*neet|doctors\s*adda", "NEET Adda247"),
+        (r"doctor\s*next", "Doctor Next"),
+        (r"sankalp", "Sankalp NEET"),
+        (r"rankplus", "Rankplus NEET"),
+        (r"unacademy\s*neet\s*toppers", "Unacademy NEET Toppers"),
+        (r"neet\s*alchemy", "NEET Alchemy (Unacademy)"),
+        (r"unacademy\s*neet", "Unacademy NEET"),
+        (r"vedantu\s*neet", "Vedantu NEET"),
+        (r"yakeen", "PW Yakeen"),
+        (r"competition\s*wallah", "Competition Wallah (PW)"),
+    ]
+    for pat, label in teacher_rules:
+        if re.search(pat, blob):
+            return label
+
+    return cand["channel"]
+
+
+def resolve_language(cand: dict) -> str:
+    blob = f"{cand['title']} {cand['channel']}".lower()
+    if any(cue in blob for cue in ENGLISH_MEDIUM_CUES) or re.search(r"\bin english\b|\benglish medium\b", blob):
+        if not re.search(r"\bhindi\b|\byakeen\b|\bumeed\b|\bprachand\b|\baarambh\b", blob):
+            return "English"
+    return "Hinglish"
+
+
+def classify_exam_and_format(cand: dict) -> tuple[str, str]:
+    title_low = cand["title"].lower()
+
+    if cand["provider"] == "playlist":
+        fmt = "Full Course"
+        if re.search(r"\b(ncert\s*line|ncert\s*highlight|ncert\s*nichod|ncert\s*decoding|ncert\s*reading)\b", title_low):
+            fmt = "NCERT Line-by-Line"
+        elif re.search(r"\b(pyq\w*|previous year|revision|formula|mind\s*map|short\s*notes|most\s*expected|top\s+\d+)\b", title_low):
+            fmt = "Revision & PYQs"
+    else:
+        if re.search(r"\b(ncert\s*line|ncert\s*highlight|ncert\s*nichod|ncert\s*decoding|ncert\s*extract|line\s*by\s*line)\b", title_low):
+            fmt = "NCERT Line-by-Line"
+        elif (
+            re.search(r"\b(pyq\w*|previous year|mind\s*map|formula|cheat\s*sheet|rapid\s*revision|short\s*notes|top\s+\d+|most\s*expected)\b", title_low)
+            and "one shot" not in title_low
+        ):
+            fmt = "Revision & PYQs"
+        else:
+            fmt = "One-Shot"
+
+    if re.search(r"\b(aiims|rank\s*booster|700\+|680\+|360/360|180/180|exemplar|assertion\s*reason)\b", title_low):
+        exam = "NEET Rank Booster"
+    elif re.search(r"\b(ncert|line\s*by\s*line|class\s*1[12])\b", title_low):
+        exam = "NEET UG + NCERT"
+    else:
+        exam = "NEET UG"
+
+    return exam, fmt
+
+
+def is_valid_chapter_candidate(cand: dict, ch_no: int, subject: str, chapter_re: re.Pattern[str]) -> bool:
+    title = cand["title"]
+    channel = cand["channel"]
+
+    # 1. Must belong to our Verified NEET UG Educator / Official Institute Channel allowlist
+    if not is_verified_neet_channel(channel):
+        return False
+
+    # 2. Reject JEE-Advanced-only, Class 9/10, Regional, and non-lecture noise
+    if HARD_REJECT_RE.search(title) or REGIONAL_REJECT_RE.search(title):
+        return False
+    # Reject JEE-only titles that do not mention NEET/AIIMS/Medical
+    if re.search(r"\b(jee|iit)\b", title, re.I) and not re.search(r"\b(neet|aiims|medical)\b", title, re.I):
+        return False
+
+    # 3. Chapter-level disambiguation guards
+    # Ch 6 (Cell: Unit of Life) vs Ch 7 (Cell Cycle & Cell Division)
+    if ch_no == 6 and re.search(r"\b(cell cycle|cell division|mitosis|meiosis)\b", title, re.I) and not re.search(r"\bunit of life\b", title, re.I):
+        return False
+    # Ch 12 (Principles of Inheritance) vs Ch 13 (Molecular Basis of Inheritance)
+    if ch_no == 12 and re.search(r"\bmolecular basis\b", title, re.I) and not re.search(r"\bprinciples? of inheritance\b", title, re.I):
+        return False
+    if ch_no == 13 and re.search(r"\bprinciples? of inheritance\b", title, re.I) and not re.search(r"\bmolecular\b", title, re.I):
+        return False
+    # Ch 20 (Zoology Biomolecules) vs Ch 72 (Chemistry Biomolecules & Practical Chemistry)
+    if ch_no == 20 and re.search(
+        r"\b(chemistry|organic|class\s*12|12th|practical|salt analysis|\bpoc\b|pankaj\s*sir|vt\s*sir|nitesh\s*devnani|yogesh\s*jain|amit\s*mahajan|sudhanshu|wassim|mohit\s*dadheech|hitesh\s*sopra|akansha\s*karnwal)\b",
+        f"{title} {channel}",
+        re.I,
+    ):
+        return False
+    if ch_no == 72:
+        if re.search(
+            r"\b(biology|zoology|botany|class\s*11\s*bio\w*|seep\s*pahuja|garima\s*goel|ritu\s*rattewal|vipin\s*sharma|ozone\s*classes|kv\s*education|tarun\s*sir|samapti|manish\s*dubey|md\s*sir|rupesh|akanksha\s*agarwal|vani\s*ma'?am|biotonic|gargi)\b",
+            f"{title} {channel}",
+            re.I,
+        ):
+            return False
+        if re.search(r"\bbiomolecules?\b", title, re.I) and not re.search(
+            r"\b(chemistry|organic|class\s*12|12th|practical|salt\s*analysis|\bpoc\b|carbohydrates?|glucose|pankaj|vt\s*sir|nitesh|yogesh|amit\s*mahajan|sudhanshu|wassim|akansha\s*karnwal)\b",
+            f"{title} {channel}",
+            re.I,
+        ):
+            return False
+    # Ch 27 (Human Reproduction) vs Ch 28 (Reproductive Health)
+    if ch_no == 27 and re.search(r"\breproductive health\b", title, re.I) and not re.search(r"\bhuman reproduction\b", title, re.I):
+        return False
+    # Ch 31 (Biotech Principles) vs Ch 32 (Biotech Applications)
+    if ch_no == 31 and re.search(r"\bapplications?\b", title, re.I) and not re.search(r"\bprinciples?\b", title, re.I):
+        return False
+    if ch_no == 32 and re.search(r"\bprinciples?\s*(?:and|&)\s*processes\b", title, re.I) and not re.search(r"\bapplications?\b", title, re.I):
+        return False
+    # Ch 34 (1D Motion) vs Ch 35 (2D Motion & Projectile)
+    if ch_no == 34 and re.search(r"\b(motion in a plane|projectile|2\s*-?\s*d)\b", title, re.I) and not re.search(r"\bstraight line\b", title, re.I):
+        return False
+    if ch_no == 35 and re.search(r"\bmotion in a straight line\b", title, re.I) and not re.search(r"\b(plane|projectile)\b", title, re.I):
+        return False
+    # Ch 44 (Waves & Sound) vs EM Waves / Matter Waves / Wave Optics
+    if ch_no == 44 and re.search(r"\b(electromagnetic waves?|\bem\s+waves?\b|matter waves?|wave optics)\b", title, re.I):
+        return False
+    # Ch 45 (Electric Charges, Fields & Potential) vs Ch 46 (Capacitors & Current Electricity)
+    if ch_no == 45 and re.search(r"\b(capacitors?|capacitance|current electricity)\b", title, re.I) and not re.search(r"\b(charges?|fields?|potential|electrostatics?|gauss)\b", title, re.I):
+        return False
+    # Ch 47 (Moving Charges) vs Ch 48 (Magnetism, Matter & EMI)
+    if ch_no == 47 and re.search(r"\b(magnetism\s*(?:and|&)\s*matter|electromagnetic induction|\bemi\b)\b", title, re.I) and not re.search(r"\bmoving charges\b", title, re.I):
+        return False
+    # Ch 50 (Ray Optics) vs Ch 51 (Wave Optics)
+    if ch_no == 50 and re.search(r"\bwave optics\b", title, re.I) and not re.search(r"\b(ray optics|geometrical optics)\b", title, re.I):
+        return False
+    # Ch 52 (Modern Physics) vs Ch 54 (Chemistry Structure of Atom)
+    if ch_no == 52 and re.search(r"\b(structure of atom|atomic structure)\b", title, re.I) and not re.search(r"\b(modern physics|nuclei|semiconductor|dual nature|physics)\b", title, re.I):
+        return False
+    # Ch 60 (Solutions & Colligative Properties) — prevent generic "Solutions" match
+    if ch_no == 60 and not re.search(
+        r"\b(liquid|dilute|colligative|raoult|van'?t\s*hoff|henry|one[\s-]*shot|1[\s-]*shot|full\s+chapter|class\s*12|chemistry|prachand|umeed|aarambh|yakeen)\b",
+        title,
+        re.I,
+    ):
+        return False
+    # Ch 66 (IUPAC & Isomerism) vs Ch 64 (Coordination Compounds isomerism)
+    if ch_no == 66 and re.search(r"\bcoordination\b", title, re.I):
+        return False
+    # Ch 67 (Hydrocarbons) vs Ch 68 (Haloalkanes & Haloarenes)
+    if ch_no == 67 and re.search(r"\b(haloalkanes?|haloarenes?)\b", title, re.I) and not re.search(r"\bhydrocarbons?\b", title, re.I):
+        return False
+
+    # 4. Reject full-subject megacompilations ("complete biology in one video", "all chapters")
+    if re.search(
+        r"\b(all\s+chapters|complete\s+(?:class\s*1[12]\s+)?(?:biology|botany|zoology|physics|chemistry|organic|inorganic|physical)\s+in\s+one)\b",
+        title,
+        re.I,
+    ):
+        return False
+    if cand["provider"] == "playlist" and re.search(r"\bin order\b|\ball chapters\b|\bcomplete (?:biology|botany|zoology|physics|chemistry)\b", title, re.I):
+        if not chapter_re.search(title):
+            return False
+
+    # 5. Avoid isolated mid-series short lecture fragments ("Part 7", "Lec 14") for single videos < 60m
+    if cand["provider"] == "youtube" and 0 < cand["duration_sec"] < 3600:
+        if re.search(r"(?:^|\b)(?:part|lec(?:ture)?|ep(?:isode)?|l)\s*[-#.]?\s*(?:[2-9]|\d{2,})\b|^#\d+\b", title, re.I):
+            if not re.search(r"\b(pyq|revision|ncert|mind\s*map|one\s*shot)\b", title, re.I):
+                return False
+
+    # 6. Strict Chapter-Title Keyword Match
+    if not chapter_re.search(title):
+        return False
+
+    # 7. Cross-Subject Guards (check hashtag-stripped title & specialist teacher cues; never penalize "Physics Wallah" channel on Bio/Chem)
+    title_clean = re.sub(r"#\w+", "", title)
+    blob_tc = f"{title_clean} {channel}"
+
+    if subject in ("Botany", "Zoology"):
+        if re.search(
+            r"\b(mr\s*sir|tamanna\s*chaudhary|prateek\s*jain|mahendra\s*singh|ayudh|pankaj\s*sir|vt\s*sir|vishal\s*tiwari|nitesh\s*devnani|amit\s*mahajan|sudhanshu|yogesh\s*jain|wassim\s*bhat|kinematics|electrostatics|mole\s*concept|organic\s*chemistry|inorganic\s*chemistry|physical\s*chemistry)\b",
+            blob_tc,
+            re.I,
+        ) or re.search(r"\b(neet\s+physics|neet\s+chemistry|class\s*1[12]\s*(?:physics|chemistry)|mathematics|maths)\b", title_clean, re.I):
+            return False
+    elif subject == "Physics":
+        if re.search(
+            r"\b(seep\s*pahuja|garima\s*goel|ritu\s*rattewal|vipin\s*sharma|ozone\s*classes|kv\s*education|tarun\s*sir|samapti|pankaj\s*sir|vt\s*sir|vishal\s*tiwari|nitesh\s*devnani|amit\s*mahajan|sudhanshu|yogesh\s*jain|wassim\s*bhat|mole\s*concept|enthalpy|gibbs|chemical\s*thermodynamics|thermochemistry|chemical\s*kinetics|botany|zoology)\b",
+            blob_tc,
+            re.I,
+        ) or re.search(r"\b(chemistry|biology|botany|zoology|mathematics|maths)\b", title_clean, re.I):
+            return False
+    elif subject == "Chemistry":
+        if re.search(
+            r"\b(seep\s*pahuja|garima\s*goel|ritu\s*rattewal|vipin\s*sharma|ozone\s*classes|kv\s*education|tarun\s*sir|samapti|mr\s*sir|tamanna\s*chaudhary|prateek\s*jain|mahendra\s*singh|ayudh|kinematics|rotational|carnot|\bktg\b|kinetic\s*theory\s*of\s*gases|modern\s*physics|semiconductors?|botany|zoology)\b",
+            blob_tc,
+            re.I,
+        ) or re.search(r"\b(neet\s+physics|class\s*1[12]\s*physics|biology|botany|zoology|mathematics|maths)\b", title_clean, re.I):
+            return False
+
+    # 8. Duration & Lesson Count Floor
+    if cand["provider"] == "playlist":
+        if cand["lesson_count"] == 1:
+            return False
+    else:
+        if 0 < cand["duration_sec"] < 900:
+            return False
+
+    return True
+
+
+def parse_age_months(published_text: str) -> float:
+    """Parse YouTube relative published text ('3 weeks ago', 'Streamed 4 months ago') into months."""
+    if not published_text:
+        return 18.0
+    low = published_text.lower()
+    m = re.search(r"(\d+)\s*(hour|day|week|month|year)", low)
+    if not m:
+        return 18.0
+    n = float(m.group(1))
+    unit = m.group(2)
+    if unit == "hour":
+        return 0.15
+    if unit == "day":
+        return max(0.2, n / 30.0)
+    if unit == "week":
+        return max(0.3, (n * 7.0) / 30.0)
+    if unit == "month":
+        return max(0.5, n)
+    if unit == "year":
+        return max(12.0, n * 12.0)
+    return 18.0
+
+
+def compute_trend_metrics(cand: dict, fmt: str) -> tuple[float, int, float, str]:
+    """Compute pure YouTube audience trend score with ZERO coaching/institute priority.
+
+    Returns (age_months, views_per_month, trend_score, trend_badge).
+    """
+    if cand["provider"] == "playlist":
+        lessons = cand["lesson_count"]
+        t_score = 64.0 + min(lessons, 45) * 0.42 + (3.5 if cand.get("sample_lectures") else 0.0)
+        badge = f"📚 {lessons} Lectures" if lessons else "📚 Full Playlist"
+        return 12.0, 0, round(t_score, 2), badge
+
+    views = max(int(cand.get("view_count") or 0), 1)
+    age_m = parse_age_months(cand.get("published") or "")
+    vpm = int(round(views / max(age_m, 0.75)))
+
+    # Pure YouTube traction formula: monthly view velocity + total student reach + freshness
+    velocity_pts = math.log10(max(vpm, 1)) * 13.5
+    reach_pts = math.log10(views) * 9.5
+    freshness_pts = 8.0 if age_m <= 6.0 else (4.5 if age_m <= 14.0 else (2.0 if age_m <= 24.0 else 0.0))
+    depth_pts = 3.5 if cand.get("duration_sec", 0) >= 5400 else 1.5
+    t_score = round(velocity_pts + reach_pts + freshness_pts + depth_pts, 2)
+
+    if vpm >= 35_000 or (age_m <= 8.0 and views >= 120_000):
+        badge = "🔥 Trending"
+    elif views >= 1_000_000:
+        badge = "⭐ Most Loved"
+    elif views >= 250_000 or vpm >= 12_000:
+        badge = "📈 Popular"
+    else:
+        badge = f"⚡ {fmt}"
+
+    return round(age_m, 1), vpm, t_score, badge
+
+
+def build_pedagogy_note(cand: dict, educator: str, exam: str, fmt: str, chapter_name: str) -> str:
+    if cand["provider"] == "playlist":
+        lessons = f"{cand['lesson_count']}-lecture " if cand["lesson_count"] else "Complete "
+        return f"{lessons}YouTube playlist by {educator} · {exam} ({chapter_name})."
+    parts = []
+    if cand["duration"]:
+        parts.append(f"{cand['duration']} {fmt.lower()}")
+    else:
+        parts.append(fmt)
+    parts.append(f"by {educator}")
+    if cand["views_text"]:
+        parts.append(f"· {cand['views_text']}")
+    return " ".join(parts)
+
+
+def build_corpus(use_cache: bool = True) -> dict:
+    compiled_chapters = []
+    chapter_tasks = []
+    for row in SYLLABUS:
+        ch_no, subject, unit, class_lvl, weightage, scope, ch_name, pat, core_q, alt_q = row
+        cre = re.compile(pat, re.I)
+        compiled_chapters.append((ch_no, subject, unit, class_lvl, weightage, scope, ch_name, cre))
+        # Pure organic YouTube NEET queries (zero institute stuffing)
+        chapter_tasks.append(("chapter", ch_no, subject, cre, f"{core_q} NEET", SP_PLAYLIST_ONLY))
+        chapter_tasks.append(("chapter", ch_no, subject, cre, f"{alt_q} NEET", SP_PLAYLIST_ONLY))
+        chapter_tasks.append(("chapter", ch_no, subject, cre, f"{core_q} NEET one shot", SP_LONG_VIDEOS))
+        chapter_tasks.append(("chapter", ch_no, subject, cre, f"{alt_q} NEET one shot NCERT", SP_LONG_VIDEOS))
+        chapter_tasks.append(("chapter", ch_no, subject, cre, f"{core_q} NEET PYQ revision", SP_LONG_VIDEOS))
+
+    for subj, tq in TEACHER_PLAYLIST_SWEEPS:
+        chapter_tasks.append(("sweep", 0, subj, None, tq, SP_PLAYLIST_ONLY))
+    for subj, vq in INSTITUTE_VIDEO_SWEEPS:
+        chapter_tasks.append(("sweep", 0, subj, None, vq, SP_LONG_VIDEOS))
+
+    print(
+        f"Executing {len(chapter_tasks)} YouTube InnerTube queries across {len(SYLLABUS)} NEET UG chapters...",
+        flush=True,
+    )
+
+    raw_results: dict[int, list[dict]] = {row[0]: [] for row in SYLLABUS}
+    sweep_candidates: list[tuple[str, dict]] = []
+
+    def worker(task):
+        kind, ch_no, subject, cre, query, sp = task
+        payload = search_youtube(query, params=sp, use_cache=use_cache)
+        cands = extract_candidates(payload)
+        if kind == "chapter":
+            kept = [c for c in cands if is_valid_chapter_candidate(c, ch_no, subject, cre)]
+            return kind, ch_no, subject, kept
+        return kind, 0, subject, cands
+
+    with ThreadPoolExecutor(max_workers=24) as pool:
+        futures = [pool.submit(worker, t) for t in chapter_tasks]
+        for fut in as_completed(futures):
+            kind, ch_no, subject, items = fut.result()
+            if kind == "chapter":
+                raw_results[ch_no].extend(items)
+            else:
+                for c in items:
+                    sweep_candidates.append((subject, c))
+
+    # Specialized chapters claim ambiguous items first
+    specialized_first = {7, 13, 20, 28, 31, 32, 35, 46, 48, 51, 54, 64, 66, 68, 72}
+    priority_chapters = sorted(
+        compiled_chapters,
+        key=lambda c: (0 if c[0] in specialized_first else 1, c[0]),
+    )
+    for subj, cand in sweep_candidates:
+        allowed_subjects = ("Botany", "Zoology") if subj == "Biology" else (subj,)
+        for ch_no, c_subj, _, _, _, _, _, cre in priority_chapters:
+            if c_subj in allowed_subjects and is_valid_chapter_candidate(cand, ch_no, c_subj, cre):
+                raw_results[ch_no].append(cand)
+                break
+
+    processing_order = sorted(
+        compiled_chapters,
+        key=lambda c: (0 if c[0] in specialized_first else 1, c[0]),
+    )
+
+    seen_global: set[tuple[str, str]] = set()
+    chapter_records_map: dict[int, list[dict]] = {}
+    chapter_meta_map: dict[int, dict] = {}
+
+    for ch_no, subject, unit, class_lvl, weightage, scope, ch_name, _ in processing_order:
+        candidates = raw_results[ch_no]
+
+        enriched = []
+        seen_local: set[tuple[str, str]] = set()
+        for cand in candidates:
+            gkey = (cand["provider"], cand["video_id"])
+            if gkey in seen_global or gkey in seen_local:
+                continue
+            seen_local.add(gkey)
+            exam, fmt = classify_exam_and_format(cand)
+            age_m, vpm, t_score, t_badge = compute_trend_metrics(cand, fmt)
+            enriched.append((t_score, age_m, vpm, t_badge, exam, fmt, cand))
+
+        # Pure YouTube Trend & Popularity pools — ZERO artificial institute priority
+        videos_pool = sorted(
+            [x for x in enriched if x[6]["provider"] == "youtube"],
+            key=lambda x: (-x[0], -x[2], -x[6]["view_count"]),
+        )
+        playlists_pool = sorted(
+            [x for x in enriched if x[6]["provider"] == "playlist"],
+            key=lambda x: (-x[0], -x[2], -x[6]["view_count"], -x[6]["lesson_count"]),
+        )
+
+        unique_ch: list[dict] = []
+        edu_cap: dict[str, int] = {}
+
+        def _try_take(pool_items: list, limit_count: int, per_edu_max: int) -> None:
+            for t_score, age_m, vpm, t_badge, exam, fmt, cand in pool_items:
+                if len(unique_ch) >= limit_count:
+                    break
+                gkey = (cand["provider"], cand["video_id"])
+                if gkey in seen_global:
+                    continue
+                institute = resolve_institute(cand)
+                educator = resolve_educator(cand, subject, unit)
+                ekey = f"{educator.casefold()}::{cand['provider']}"
+                if edu_cap.get(ekey, 0) >= per_edu_max:
+                    continue
+                seen_global.add(gkey)
+                edu_cap[ekey] = edu_cap.get(ekey, 0) + 1
+                lang = resolve_language(cand)
+
+                unique_ch.append(
+                    {
+                        "provider": cand["provider"],
+                        "video_id": cand["video_id"],
+                        "embed_video_id": cand["embed_video_id"],
+                        "url": cand["url"],
+                        "title": cand["title"],
+                        "channel": cand["channel"],
+                        "channel_url": cand["channel_url"],
+                        "institute": institute,
+                        "educator": educator,
+                        "language": lang,
+                        "thumbnail": cand["thumbnail"],
+                        "subject": subject,
+                        "unit": unit,
+                        "chapter_no": ch_no,
+                        "chapter": ch_name,
+                        "class_level": class_lvl,
+                        "weightage": weightage,
+                        "syllabus_scope": scope,
+                        "target_exam": exam,
+                        "format": fmt,
+                        "lesson_count": cand["lesson_count"],
+                        "duration": cand["duration"],
+                        "duration_sec": cand["duration_sec"],
+                        "views_text": cand["views_text"],
+                        "view_count": cand["view_count"],
+                        "published": cand["published"],
+                        "age_months": age_m,
+                        "views_per_month": vpm,
+                        "trend_score": t_score,
+                        "trend_badge": t_badge,
+                        "score": t_score,
+                        "note": build_pedagogy_note(cand, educator, exam, fmt, ch_name),
+                        "sample_lectures": cand.get("sample_lectures") or [],
+                    }
+                )
+
+        # Balanced selection purely by YouTube Trend & Popularity (14 top trending videos + 8 top playlists)
+        _try_take(videos_pool, 14, 2)
+        _try_take(playlists_pool, len(unique_ch) + 8, 2)
+        if len(unique_ch) < 20:
+            combined_pool = sorted(
+                videos_pool + playlists_pool,
+                key=lambda x: (-x[0], -x[2], -x[6]["view_count"]),
+            )
+            _try_take(combined_pool, 22, 3)
+
+        # CRITICAL: Sort strictly by -trend_score, -views_per_month, -view_count (ZERO institute priority)
+        unique_ch.sort(
+            key=lambda r: (
+                -r["trend_score"],
+                -r["views_per_month"],
+                -r["view_count"],
+            )
+        )
+        pl_cnt = sum(1 for r in unique_ch if r["provider"] == "playlist")
+
+        yt_pl_q = urllib.parse.quote_plus(f"{ch_name} NEET")
+        yt_os_q = urllib.parse.quote_plus(f"{ch_name} NEET one shot")
+
+        chapter_records_map[ch_no] = unique_ch
+        chapter_meta_map[ch_no] = {
+            "chapter_no": ch_no,
+            "subject": subject,
+            "unit": unit,
+            "class_level": class_lvl,
+            "weightage": weightage,
+            "syllabus_scope": scope,
+            "chapter": ch_name,
+            "count": len(unique_ch),
+            "playlist_count": pl_cnt,
+            "video_count": len(unique_ch) - pl_cnt,
+            "yt_playlists_url": f"https://www.youtube.com/results?search_query={yt_pl_q}&sp=EgIQAw%253D%253D",
+            "yt_oneshots_url": f"https://www.youtube.com/results?search_query={yt_os_q}&sp=EgIYAg%253D%253D",
+        }
+
+    # Assemble in canonical syllabus order 1..72
+    syllabus_out = [chapter_meta_map[n] for n in range(1, len(SYLLABUS) + 1)]
+    all_entries: list[dict] = []
+    for n in range(1, len(SYLLABUS) + 1):
+        all_entries.extend(chapter_records_map[n])
+
+    by_score = sorted(
+        all_entries,
+        key=lambda x: (-x["trend_score"], -x["views_per_month"], -x["view_count"], x["chapter_no"]),
+    )
+    for idx, rec in enumerate(by_score, 1):
+        rec["global_rank"] = idx
+
+    edu_buckets: dict[str, dict] = {}
+    for rec in all_entries:
+        edu = rec["educator"]
+        if edu not in edu_buckets:
+            edu_buckets[edu] = {
+                "educator": edu,
+                "subjects": Counter(),
+                "total": 0,
+                "playlists": 0,
+                "videos": 0,
+                "chapters": set(),
+            }
+        b = edu_buckets[edu]
+        b["subjects"][rec["subject"]] += 1
+        b["total"] += 1
+        b["chapters"].add(rec["chapter_no"])
+        if rec["provider"] == "playlist":
+            b["playlists"] += 1
+        else:
+            b["videos"] += 1
+
+    educators_out = []
+    for edu, b in edu_buckets.items():
+        primary_subject = b["subjects"].most_common(1)[0][0]
+        educators_out.append(
+            {
+                "educator": edu,
+                "subject": primary_subject,
+                "total": b["total"],
+                "playlists": b["playlists"],
+                "videos": b["videos"],
+                "chapter_coverage": len(b["chapters"]),
+            }
+        )
+    educators_out.sort(
+        key=lambda e: (
+            -e["total"],
+            -e["playlists"],
+            e["educator"],
+        )
+    )
+
+    inst_buckets: dict[str, dict] = {}
+    for rec in all_entries:
+        inst = rec["institute"]
+        if inst not in inst_buckets:
+            inst_buckets[inst] = {
+                "institute": inst,
+                "total": 0,
+                "playlists": 0,
+                "videos": 0,
+                "chapters": set(),
+            }
+        ib = inst_buckets[inst]
+        ib["total"] += 1
+        ib["chapters"].add(rec["chapter_no"])
+        if rec["provider"] == "playlist":
+            ib["playlists"] += 1
+        else:
+            ib["videos"] += 1
+
+    institutes_out = [
+        {
+            "institute": inst,
+            "total": ib["total"],
+            "playlists": ib["playlists"],
+            "videos": ib["videos"],
+            "chapter_coverage": len(ib["chapters"]),
+        }
+        for inst, ib in inst_buckets.items()
+    ]
+    institutes_out.sort(
+        key=lambda i: (
+            -i["total"],
+            i["institute"],
+        )
+    )
+
+    playlists_total = sum(1 for x in all_entries if x["provider"] == "playlist")
+    chapters_with_pl = sum(1 for c in syllabus_out if c["playlist_count"] > 0)
+
+    output = {
+        "meta": {
+            "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "chapters_total": len(SYLLABUS),
+            "chapters_populated": sum(1 for c in syllabus_out if c["count"] > 0),
+            "chapters_with_playlists": chapters_with_pl,
+            "entries_published": len(all_entries),
+            "playlists_published": playlists_total,
+            "videos_published": len(all_entries) - playlists_total,
+            "distinct_institutes": len(institutes_out),
+            "distinct_educators": len(educators_out),
+            "distinct_channels": len({x["channel"].casefold() for x in all_entries}),
+            "queries_executed": len(chapter_tasks),
+            "live_requests": STATS["requests"],
+            "cached_requests": STATS["cached"],
+        },
+        "institutes": institutes_out,
+        "educators": educators_out,
+        "syllabus": syllabus_out,
+        "videos": all_entries,
+    }
+    OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    OUT_PATH.write_text(json.dumps(output, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return output
+
+
+def self_test() -> None:
+    assert len(SYLLABUS) == 72, f"Expected 72 canonical NEET UG chapters, got {len(SYLLABUS)}"
+    nums = [r[0] for r in SYLLABUS]
+    assert nums == list(range(1, 73)), "Chapter numbers must be contiguous 1..72"
+
+    bot_chs = [r for r in SYLLABUS if r[1] == "Botany"]
+    zoo_chs = [r for r in SYLLABUS if r[1] == "Zoology"]
+    phy_chs = [r for r in SYLLABUS if r[1] == "Physics"]
+    che_chs = [r for r in SYLLABUS if r[1] == "Chemistry"]
+    assert (len(bot_chs), len(zoo_chs), len(phy_chs), len(che_chs)) == (17, 15, 20, 20), (
+        f"Unexpected subject split: {(len(bot_chs), len(zoo_chs), len(phy_chs), len(che_chs))}"
+    )
+
+    assert parse_views("1.8M views") == 1_800_000
+    assert parse_views("425K views") == 425_000
+    assert parse_duration_seconds("7:42:15") == 27735
+    assert parse_duration_seconds("45:10") == 2710
+
+    cre_mol = re.compile(SYLLABUS[12][7], re.I)  # Ch 13 Molecular Basis of Inheritance
+    good_vid = {
+        "provider": "youtube",
+        "video_id": "abcdefghijk",
+        "title": "Molecular Basis of Inheritance in ONE SHOT | Complete NCERT | NEET 2025 | Vipin Sharma",
+        "channel": "Competition Wallah",
+        "lesson_count": 0,
+        "duration_sec": 21600,
+        "view_count": 2_400_000,
+        "published": "5 months ago",
+        "sample_lectures": [],
+    }
+    assert is_valid_chapter_candidate(good_vid, 13, "Botany", cre_mol)
+    assert resolve_educator(good_vid, "Botany", "Genetics") == "Vipin Sharma (Ozone Classes)"
+    assert resolve_institute(good_vid) == "Physics Wallah (PW)"
+
+    # Reject JEE Advanced / Irodov / MathonGo
+    bad_jee_adv = {
+        "provider": "youtube",
+        "video_id": "12345678901",
+        "title": "Rotational Motion Irodov & Pathfinder Solutions | JEE Advanced",
+        "channel": "Physics Wallah",
+        "lesson_count": 0,
+        "duration_sec": 7200,
+        "view_count": 150000,
+        "sample_lectures": [],
+    }
+    cre_rot = re.compile(SYLLABUS[37][7], re.I)
+    assert not is_valid_chapter_candidate(bad_jee_adv, 38, "Physics", cre_rot)
+
+    # Reject regional channels
+    assert not is_verified_neet_channel("Unacademy NEET Tamil")
+    assert not is_verified_neet_channel("Vedantu Telugu NEET")
+    assert not is_verified_neet_channel("ALLEN JEE")
+    assert not is_verified_neet_channel("MR Sir Fan Club")
+    assert is_verified_neet_channel("Competition Wallah")
+    assert is_verified_neet_channel("ALLEN NEET")
+    assert is_verified_neet_channel("Ozone Classes")
+    assert is_verified_neet_channel("Seep Pahuja")
+
+    print("self-test ok (72 canonical NCERT NEET UG chapters, verified-channel & pure-trend guards validated)", flush=True)
+
+
+def main(argv: list[str]) -> int:
+    if "--self-test" in argv:
+        self_test()
+        return 0
+    self_test()
+    use_cache = "--fresh" not in argv
+    out = build_corpus(use_cache=use_cache)
+    m = out["meta"]
+    inst_lines = "\n".join(
+        f"  - {i['institute']:<32}: {i['total']:>4} ({i['playlists']:>3} PL, {i['videos']:>3} vids across {i['chapter_coverage']:>2} ch)"
+        for i in out["institutes"]
+    )
+    subj_counts = Counter(v["subject"] for v in out["videos"])
+    subj_lines = "\n".join(f"  - {s:<12}: {subj_counts[s]:>4}" for s in ("Botany", "Zoology", "Physics", "Chemistry"))
+    low_chs = [c for c in out["syllabus"] if c["count"] < 6]
+    print(
+        f"\n=== NEETTUBE 72-CHAPTER CORPUS REPORT ===\n"
+        f"Chapters populated      : {m['chapters_populated']} / {m['chapters_total']}\n"
+        f"Chapters with playlists : {m['chapters_with_playlists']} / {m['chapters_total']}\n"
+        f"Chapters with < 6 items : {len(low_chs)}\n"
+        f"Total NEET resources    : {m['entries_published']} ({m['playlists_published']} playlists, {m['videos_published']} lectures)\n"
+        f"Distinct NEET institutes: {m['distinct_institutes']}\n"
+        f"Distinct NEET educators : {m['distinct_educators']} ({m['distinct_channels']} verified channels)\n"
+        f"Subject Breakdown:\n{subj_lines}\n"
+        f"Institute Breakdown:\n{inst_lines}\n"
+        f"Output written to       : {OUT_PATH}",
+        flush=True,
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
